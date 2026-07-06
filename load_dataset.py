@@ -1,8 +1,9 @@
 """
-Download selected columns from a Hugging Face parquet dataset using DuckDB.
+Download selected columns from a Hugging Face parquet dataset using DuckDB,
+preserving the train/validation/test split.
 
 Only the 'rgb', 'semantic', and 'semantic_labels' columns are pulled and
-written to ./cart_dataset/ as parquet.
+written to ./cart_dataset/ as parquet, partitioned by split.
 
 Setup:
     pip install duckdb python-dotenv
@@ -26,13 +27,24 @@ from dotenv import load_dotenv
 # --------------------------------------------------------------------------
 DATASET_REPO = "UItraviolet/industrial_cart"   # HF repo id, e.g. "org/dataset"
 # Glob for the parquet files inside the repo. "**/*.parquet" grabs everything
-# in every split/config; narrow it (e.g. "data/train-*.parquet") if you only
-# want one split. Check the "Files and versions" tab on HF to see the layout.
+# in every split/config. We rely on HF's standard shard naming convention
+# (e.g. "train-00000-of-00001.parquet", "validation-...", "test-...") to
+# recover the split — check "Files and versions" on HF to confirm your
+# dataset follows this convention before relying on the regex below.
 DATASET_GLOB = "**/*.parquet"
 
 COLUMNS = ["rgb", "semantic", "semantic_labels"]
 OUTPUT_DIR = Path("cart_dataset")
-OUTPUT_FILE = OUTPUT_DIR / "data.parquet"
+
+# Maps a chunk of the source filename to a normalized split name.
+# Order matters: check longer/more specific patterns first if you add more.
+SPLIT_PATTERNS = {
+    "train": "train",
+    "validation": "validation",
+    "valid": "validation",
+    "val": "validation",
+    "test": "test",
+}
 
 # --------------------------------------------------------------------------
 # Logging
@@ -78,6 +90,23 @@ def build_connection(token: str) -> duckdb.DuckDBPyConnection:
     return con
 
 
+def build_split_case_expr() -> str:
+    """
+    Builds a SQL CASE expression that derives a normalized split name from
+    the source filename, using SPLIT_PATTERNS. Falls back to 'unknown' if
+    no pattern matches, so nothing silently vanishes.
+    """
+    lines = ["CASE"]
+    for pattern, split_name in SPLIT_PATTERNS.items():
+        lines.append(
+            f"    WHEN regexp_matches(filename, '(^|[-_/])({pattern})([-_.]|$)') "
+            f"THEN '{split_name}'"
+        )
+    lines.append("    ELSE 'unknown'")
+    lines.append("END")
+    return "\n".join(lines)
+
+
 def download():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -86,36 +115,77 @@ def download():
 
     source_uri = f"hf://datasets/{DATASET_REPO}/{DATASET_GLOB}"
     col_list = ", ".join(COLUMNS)
+    split_expr = build_split_case_expr()
 
     log.info("Source: %s", source_uri)
     log.info("Columns requested: %s", col_list)
-    log.info("Output: %s", OUTPUT_FILE.resolve())
+    log.info("Output dir (partitioned by split): %s", OUTPUT_DIR.resolve())
 
-    # Quick peek at row count first (also validates the query before the
-    # full copy runs).
-    log.info("Checking dataset (row count)...")
+    # filename=true exposes the source parquet shard path as a column,
+    # which is what lets us recover the split without needing a 'split'
+    # column to already exist in the data itself.
+    read_expr = f"read_parquet('{source_uri}', filename=true)"
+
+    # Quick peek: row count per derived split, before doing the full copy.
+    # This also validates the regex against your actual filenames early,
+    # instead of discovering a mismatch after paying for the full download.
+    log.info("Checking dataset (row count per split)...")
     t0 = time.time()
     try:
-        count = con.execute(f"""
-            SELECT COUNT(*) FROM read_parquet('{source_uri}')
-        """).fetchone()[0]
+        rows = con.execute(f"""
+            SELECT
+                {split_expr} AS split,
+                COUNT(*) AS n
+            FROM {read_expr}
+            GROUP BY split
+            ORDER BY split
+        """).fetchall()
     except duckdb.Error as e:
         log.error("Failed to read dataset schema/rows: %s", e)
         sys.exit(1)
-    log.info("Dataset has %s rows (checked in %.1fs).", f"{count:,}", time.time() - t0)
+
+    if not rows:
+        log.error("Query returned no rows — check DATASET_REPO/DATASET_GLOB.")
+        sys.exit(1)
+
+    for split_name, n in rows:
+        log.info("  split=%-12s rows=%s", split_name, f"{n:,}")
+    log.info("Row count check done in %.1fs.", time.time() - t0)
+
+    if any(split_name == "unknown" for split_name, _ in rows):
+        log.warning(
+            "Some rows had a filename that didn't match any pattern in "
+            "SPLIT_PATTERNS — they were tagged 'unknown'. Inspect "
+            "%s to see the raw filenames.",
+            f"SELECT DISTINCT filename FROM {read_expr}",
+        )
 
     log.info("Starting download + column selection (progress bar below)...")
     t0 = time.time()
     con.execute(f"""
         COPY (
-            SELECT {col_list}
-            FROM read_parquet('{source_uri}')
-        ) TO '{OUTPUT_FILE.as_posix()}' (FORMAT PARQUET);
+            SELECT
+                {col_list},
+                {split_expr} AS split
+            FROM {read_expr}
+        ) TO '{OUTPUT_DIR.as_posix()}' (
+            FORMAT PARQUET,
+            PARTITION_BY (split),
+            OVERWRITE_OR_IGNORE
+        );
     """)
     elapsed = time.time() - t0
 
-    size_mb = OUTPUT_FILE.stat().st_size / (1024 * 1024)
-    log.info("Done in %.1fs. Wrote %.2f MB to %s", elapsed, size_mb, OUTPUT_FILE)
+    total_size_mb = sum(
+        f.stat().st_size for f in OUTPUT_DIR.rglob("*.parquet")
+    ) / (1024 * 1024)
+    log.info(
+        "Done in %.1fs. Wrote %.2f MB across split partitions under %s",
+        elapsed, total_size_mb, OUTPUT_DIR,
+    )
+    for split_dir in sorted(OUTPUT_DIR.glob("split=*")):
+        n_files = len(list(split_dir.glob("*.parquet")))
+        log.info("  %s -> %d file(s)", split_dir.name, n_files)
 
     con.close()
 
