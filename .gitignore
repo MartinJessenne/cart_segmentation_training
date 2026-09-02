@@ -6,15 +6,13 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
+# Environnements virtuels
 .venv
-
 .env
 
-uv.lock
-
-cart_dataset
-
-dataset
-
+# Sorties de la chaine : rapatriees ou reconstruites, jamais versionnees.
+_rfdetr_dataset/
+_preview/
+output/
+cart_dataset/
 dataset/
