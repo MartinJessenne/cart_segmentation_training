@@ -57,13 +57,16 @@ VARIANTS = {
 #
 # GaussNoise models the two dominant sensor terms, photon shot noise and read
 # noise, both Gaussian. Uniform noise would model quantisation, which is one LSB
-# and negligible against them.
+# and negligible against them. Kornia cannot sample a per-image std and takes
+# the upper bound as a fixed value, so the bound is the noise level every image
+# actually receives: 0.03 is a realistic warehouse signal-to-noise ratio, where
+# 0.05 would apply the worst case to every frame.
 WAREHOUSE_AUG = {
     "HorizontalFlip": {"p": 0.5},
     "ColorJitter": {"brightness": 0.2, "contrast": 0.2,
                     "saturation": 0.2, "hue": 0.1, "p": 0.5},
     "GaussianBlur": {"blur_limit": 3, "p": 0.3},
-    "GaussNoise": {"std_range": [0.01, 0.05], "p": 0.3},
+    "GaussNoise": {"std_range": [0.01, 0.03], "p": 0.3},
 }
 
 # What deserves to outlive the machine: the retained weights, the exported
@@ -139,6 +142,14 @@ def main():
     # Off by default: the multi-scale range is wide enough that adjacent
     # resolution tiers would overlap and the comparison would lose its meaning.
     ap.add_argument("--multi-scale", action="store_true")
+    # The jitter branch crops to a square (scale, scale) even when the resize
+    # preserves aspect, so a batch mixes 360x360 and 360x576 samples. Batching
+    # mixed sizes is normal and the collator pads to the batch maximum, but the
+    # Kornia path pads the images and not the masks, and mask collation raises.
+    # Kept as a switch so the CPU backend, which collates masks elsewhere, can
+    # be tried against it.
+    ap.add_argument("--scale-jitter", action="store_true")
+    ap.add_argument("--aug-backend", default="kornia", choices=("kornia", "cpu"))
     # 100 epochs is a ceiling, not a fixed duration: early stopping hands back
     # control once validation stops improving. The patience and delta below are
     # RF-DETR's own defaults; only the switch is off by default.
@@ -189,8 +200,9 @@ def main():
         resolution=resolution,
         square_resize_div_64=False,
         multi_scale=args.multi_scale,
+        scale_jitter=args.scale_jitter,
         aug_config=WAREHOUSE_AUG,
-        augmentation_backend="kornia",
+        augmentation_backend=args.aug_backend,
         checkpoint_interval=args.checkpoint_interval,
         early_stopping=True,
         early_stopping_patience=args.patience,
@@ -209,8 +221,9 @@ def main():
         "batch_size": args.batch_size,
         "grad_accum_steps": args.grad_accum_steps,
         "multi_scale": args.multi_scale,
+        "scale_jitter": args.scale_jitter,
         "augmentation": WAREHOUSE_AUG,
-        "augmentation_backend": "kornia",
+        "augmentation_backend": args.aug_backend,
         "patience": args.patience,
         "min_delta": args.min_delta,
         "seed": args.seed,
