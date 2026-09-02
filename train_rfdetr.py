@@ -72,12 +72,15 @@ WAREHOUSE_AUG = {
 # What deserves to outlive the machine: the retained weights, the exported
 # graph, the summaries and the logs. Per-epoch checkpoints are deliberately
 # excluded; they are heavy and carry no conclusion.
-PUBLISHED_PATTERNS = ["*.json", "*.txt", "*.csv", "*.onnx", "checkpoint_best*.pth"]
+PUBLISHED_PATTERNS = ["*.json", "*.txt", "*.csv", "*.onnx",
+                      "*best*.ckpt", "*best*.pth"]
 
-# Ordered by preference: the periodic checkpoint is the most recent state, the
-# best-metric one is a fallback that costs at most the epochs since it was cut.
-RESUME_PATTERNS = ["checkpoint.pth", "checkpoint_best_total.pth",
-                   "checkpoint_best*.pth"]
+# Ordered by preference: "last" is written every epoch and is the cheapest
+# resume point; the best-metric file is a fallback costing the epochs since it
+# was cut. Lightning writes .ckpt, older RF-DETR paths write .pth, so both are
+# matched rather than assumed.
+RESUME_PATTERNS = ["last.ckpt", "last.pth", "checkpoint.pth",
+                   "*best*.ckpt", "*best*.pth"]
 
 
 def class_names_from_dataset(dataset_dir):
@@ -158,10 +161,30 @@ def main():
     # Comparing variants only means something if everything else is held fixed.
     # The seed is part of that, and RF-DETR leaves it unset on its own.
     ap.add_argument("--seed", type=int, default=42)
-    # The machine goes down regularly and a 100-epoch run outlasts its observed
-    # uptime. RF-DETR's own default writes a checkpoint every 10 epochs, which
-    # would put up to 10 epochs at risk; 1 makes a crash cost one epoch.
-    ap.add_argument("--checkpoint-interval", type=int, default=1)
+    # Two rolling checkpoints and nothing else. RF-DETR registers three
+    # callbacks: a "last" one written every epoch with save_top_k=1, a best-mAP
+    # one, and an archive `checkpoint_{epoch}` with save_top_k=-1 that keeps
+    # every file it ever writes. The archive's retention is hardcoded, so the
+    # only way to silence it is an interval longer than the run -- hence the
+    # default below. Setting the interval to 1 does the opposite of what it
+    # looks like: it makes the archive fire every epoch (100 files, ~40 GB) and
+    # it also suppresses the "last" callback, which is skipped exactly when the
+    # interval equals 1.
+    ap.add_argument("--checkpoint-interval", type=int, default=None,
+                    help="epochs between archive checkpoints; "
+                         "defaults to more than the run, keeping only last+best")
+    # The detection head is rebuilt for 3 classes and, whenever --resolution
+    # differs from the variant's nominal value, the pretrained position table is
+    # interpolated onto a new grid. Both make the first steps noisy, and DETR
+    # models are fragile there. RF-DETR ships 0.0, which starts at full rate.
+    ap.add_argument("--warmup-epochs", type=float, default=1.0)
+    # RF-DETR ships lr_drop equal to the epoch budget, so the step lands on the
+    # last epoch and the rate is constant throughout -- the refinement phase
+    # never happens. Dropping at three quarters of the budget gives the mask
+    # boundaries a low-rate phase to settle in, which is what the pose stage
+    # reads.
+    ap.add_argument("--lr-drop", type=int, default=None,
+                    help="epoch of the learning-rate step; defaults to 75%% of epochs")
     ap.add_argument("--resume-from", default=None)
     ap.add_argument("--no-resume", action="store_true")
     ap.add_argument("--output-dir", default=None)
@@ -170,6 +193,8 @@ def main():
 
     cls, nominal = VARIANTS[args.variant]
     resolution = args.resolution or nominal
+    lr_drop = args.lr_drop or max(1, round(args.epochs * 0.75))
+    checkpoint_interval = args.checkpoint_interval or (args.epochs + 1)
     long_side = round(resolution * 1.6)
     run_name = f"seg_{args.variant}_{resolution}"
     output_dir = args.output_dir or os.path.join("output", run_name)
@@ -186,6 +211,8 @@ def main():
     print(f"capability : {torch.cuda.get_device_capability()}")
     print(f"dataset    : {args.dataset_dir}")
     print(f"classes    : {classes}")
+    print(f"schedule   : {args.epochs} epochs, warmup {args.warmup_epochs}, "
+          f"lr_drop {lr_drop}, archive every {checkpoint_interval}")
     print(f"resume     : {resume_from or 'fresh run'}")
     print(f"output     : {output_dir}\n")
 
@@ -203,7 +230,9 @@ def main():
         scale_jitter=args.scale_jitter,
         aug_config=WAREHOUSE_AUG,
         augmentation_backend=args.aug_backend,
-        checkpoint_interval=args.checkpoint_interval,
+        checkpoint_interval=checkpoint_interval,
+        warmup_epochs=args.warmup_epochs,
+        lr_drop=lr_drop,
         early_stopping=True,
         early_stopping_patience=args.patience,
         early_stopping_min_delta=args.min_delta,
@@ -224,6 +253,9 @@ def main():
         "scale_jitter": args.scale_jitter,
         "augmentation": WAREHOUSE_AUG,
         "augmentation_backend": args.aug_backend,
+        "warmup_epochs": args.warmup_epochs,
+        "lr_drop": lr_drop,
+        "checkpoint_interval": checkpoint_interval,
         "patience": args.patience,
         "min_delta": args.min_delta,
         "seed": args.seed,
