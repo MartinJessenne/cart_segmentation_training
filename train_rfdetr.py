@@ -86,11 +86,6 @@ RESUME_PATTERNS = ["last.ckpt", "last.pth", "checkpoint.pth",
                    "*best*.ckpt", "*best*.pth"]
 
 
-def batch_size_arg(value):
-    """Accept an explicit micro-batch or "auto", which probes the device."""
-    return value if value == "auto" else int(value)
-
-
 def class_names_from_dataset(dataset_dir):
     """The class order as RF-DETR derives it, read from COCO rather than retyped.
 
@@ -148,18 +143,18 @@ def main():
     # lr_drop is 100 too, so the learning-rate step lands at the end of the
     # budget and a shorter run forfeits its refinement phase.
     ap.add_argument("--epochs", type=int, default=100)
-    # "auto" probes the largest micro-batch the device holds and derives
-    # grad_accum_steps itself to reach --effective-batch. The tiers differ by
-    # 2.8x in pixels and the medium variant carries 200 queries rather than 100,
-    # so a batch that fits at 360x576 need not fit at 600x960; fixing it by hand
-    # means discovering that as an out-of-memory crash hours into a run.
-    ap.add_argument("--batch-size", type=batch_size_arg, default="auto")
-    # Consulted only when --batch-size is an explicit number; under "auto" the
-    # probe overwrites it.
-    ap.add_argument("--grad-accum-steps", type=int, default=1)
-    # What the optimiser sees per step. RF-DETR is tuned for 16 when fine-tuning,
-    # and holding it fixed is what keeps the nine runs comparable: the micro-batch
-    # may differ from tier to tier, the effective batch may not.
+    # Micro-batch per forward pass. The device holds far more than this -- the
+    # probe reports 31 for nano at 360x576 on 96 GB -- but capacity is not the
+    # criterion. batch_size="auto" cannot be used here: it returns the largest
+    # micro-batch that fits and accumulates only when that falls below the
+    # target, so it resolves to an effective batch of 31 at 360x576 and to
+    # something else again at 600x960. The nine runs would then differ in the
+    # one quantity the comparison has to hold fixed.
+    ap.add_argument("--batch-size", type=int, default=16)
+    # What the optimiser sees per step, and the invariant of the matrix.
+    # RF-DETR is tuned for 16 when fine-tuning; grad_accum_steps is derived from
+    # this and --batch-size, so lowering the micro-batch at a heavier tier
+    # raises the accumulation and leaves the product untouched.
     ap.add_argument("--effective-batch", type=int, default=16)
     # Off by default: the multi-scale range is wide enough that adjacent
     # resolution tiers would overlap and the comparison would lose its meaning.
@@ -233,6 +228,11 @@ def main():
     lr_drop = args.lr_drop or max(1, round(args.epochs * 0.75))
     checkpoint_interval = args.checkpoint_interval or (args.epochs + 1)
     patience_evals = max(1, round(args.patience / args.eval_interval))
+    if args.effective_batch % args.batch_size:
+        ap.error(f"--effective-batch {args.effective_batch} is not a multiple of "
+                 f"--batch-size {args.batch_size}: the optimiser would see a "
+                 "different batch from the one asked for")
+    grad_accum_steps = args.effective_batch // args.batch_size
     long_side = round(resolution * 1.6)
     run_name = f"seg_{args.variant}_{resolution}"
     output_dir = args.output_dir or os.path.join("output", run_name)
@@ -251,7 +251,8 @@ def main():
     print(f"classes    : {classes}")
     print(f"schedule   : {args.epochs} epochs, warmup {args.warmup_epochs}, "
           f"lr_drop {lr_drop}, archive every {checkpoint_interval}")
-    print(f"batch      : {args.batch_size} micro, effective {args.effective_batch}")
+    print(f"batch      : {args.batch_size} micro x {grad_accum_steps} accum "
+          f"= {args.effective_batch} effective")
     print(f"validation : every {args.eval_interval} epochs, EMA only, "
           f"patience {args.patience} epochs ({patience_evals} evals)")
     print(f"resume     : {resume_from or 'fresh run'}")
@@ -263,8 +264,7 @@ def main():
         dataset_dir=args.dataset_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        grad_accum_steps=args.grad_accum_steps,
-        auto_batch_target_effective=args.effective_batch,
+        grad_accum_steps=grad_accum_steps,
         output_dir=output_dir,
         resolution=resolution,
         square_resize_div_64=False,
@@ -274,7 +274,10 @@ def main():
         augmentation_backend=args.aug_backend,
         checkpoint_interval=checkpoint_interval,
         warmup_epochs=args.warmup_epochs,
-        lr_drop=lr_drop,
+        # The scheduler's own interface. The flat lr_drop= argument still works
+        # but is deprecated, and a version that drops it would take the
+        # refinement phase with it without failing.
+        lr_scheduler_kwargs={"lr_drop": lr_drop},
         eval_interval=args.eval_interval,
         # Validation forwards through the EMA weights only. Left False, RF-DETR
         # runs a second independent forward pass and a second full round of RLE
@@ -282,6 +285,11 @@ def main():
         # already dominates the run. The EMA weights are the ones exported, so
         # the base model's metrics answer no question being asked here.
         eval_ema_only=True,
+        # Nothing reads the validation loss: early stopping and best-checkpoint
+        # selection both follow the EMA mAP, and the "step" schedule ignores its
+        # monitor. Computing it runs the Hungarian matcher over every validation
+        # mask for a number that is only ever printed.
+        compute_val_loss=False,
         early_stopping=True,
         early_stopping_patience=patience_evals,
         early_stopping_min_delta=args.min_delta,
@@ -300,7 +308,7 @@ def main():
         "input_hw": [resolution, long_side],
         "epochs": args.epochs,
         "batch_size": args.batch_size,
-        "grad_accum_steps": args.grad_accum_steps,
+        "grad_accum_steps": grad_accum_steps,
         "effective_batch": args.effective_batch,
         "multi_scale": args.multi_scale,
         "scale_jitter": args.scale_jitter,
