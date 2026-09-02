@@ -86,6 +86,11 @@ RESUME_PATTERNS = ["last.ckpt", "last.pth", "checkpoint.pth",
                    "*best*.ckpt", "*best*.pth"]
 
 
+def batch_size_arg(value):
+    """Accept an explicit micro-batch or "auto", which probes the device."""
+    return value if value == "auto" else int(value)
+
+
 def class_names_from_dataset(dataset_dir):
     """The class order as RF-DETR derives it, read from COCO rather than retyped.
 
@@ -143,12 +148,19 @@ def main():
     # lr_drop is 100 too, so the learning-rate step lands at the end of the
     # budget and a shorter run forfeits its refinement phase.
     ap.add_argument("--epochs", type=int, default=100)
-    # Effective batch = batch_size * grad_accum_steps. RF-DETR is tuned for 16
-    # when fine-tuning. At the higher resolution tiers the activations may not
-    # fit in one batch, in which case lower batch-size and raise grad-accum to
-    # hold the product at 16.
-    ap.add_argument("--batch-size", type=int, default=16)
+    # "auto" probes the largest micro-batch the device holds and derives
+    # grad_accum_steps itself to reach --effective-batch. The tiers differ by
+    # 2.8x in pixels and the medium variant carries 200 queries rather than 100,
+    # so a batch that fits at 360x576 need not fit at 600x960; fixing it by hand
+    # means discovering that as an out-of-memory crash hours into a run.
+    ap.add_argument("--batch-size", type=batch_size_arg, default="auto")
+    # Consulted only when --batch-size is an explicit number; under "auto" the
+    # probe overwrites it.
     ap.add_argument("--grad-accum-steps", type=int, default=1)
+    # What the optimiser sees per step. RF-DETR is tuned for 16 when fine-tuning,
+    # and holding it fixed is what keeps the nine runs comparable: the micro-batch
+    # may differ from tier to tier, the effective batch may not.
+    ap.add_argument("--effective-batch", type=int, default=16)
     # Off by default: the multi-scale range is wide enough that adjacent
     # resolution tiers would overlap and the comparison would lose its meaning.
     ap.add_argument("--multi-scale", action="store_true")
@@ -239,6 +251,7 @@ def main():
     print(f"classes    : {classes}")
     print(f"schedule   : {args.epochs} epochs, warmup {args.warmup_epochs}, "
           f"lr_drop {lr_drop}, archive every {checkpoint_interval}")
+    print(f"batch      : {args.batch_size} micro, effective {args.effective_batch}")
     print(f"validation : every {args.eval_interval} epochs, EMA only, "
           f"patience {args.patience} epochs ({patience_evals} evals)")
     print(f"resume     : {resume_from or 'fresh run'}")
@@ -251,6 +264,7 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         grad_accum_steps=args.grad_accum_steps,
+        auto_batch_target_effective=args.effective_batch,
         output_dir=output_dir,
         resolution=resolution,
         square_resize_div_64=False,
@@ -287,6 +301,7 @@ def main():
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "grad_accum_steps": args.grad_accum_steps,
+        "effective_batch": args.effective_batch,
         "multi_scale": args.multi_scale,
         "scale_jitter": args.scale_jitter,
         "augmentation": WAREHOUSE_AUG,
