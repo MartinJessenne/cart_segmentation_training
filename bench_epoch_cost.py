@@ -55,6 +55,10 @@ def measure(variant, resolution, dataset_dir, batch_size, settle_rows,
              "--resolution", str(resolution),
              "--dataset-dir", dataset_dir,
              "--batch-size", str(batch_size),
+             # Accumulation of one: the measurement is of raw throughput, and
+             # the training script refuses a micro-batch the effective batch is
+             # not a multiple of.
+             "--effective-batch", str(batch_size),
              "--epochs", "1", "--output-dir", output_dir, "--no-resume"],
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 
