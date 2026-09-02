@@ -25,7 +25,10 @@
 # training returns. A failing run does not stop the matrix.
 set -u
 
-GROUPS=(
+# Not GROUPS: bash owns that name, holding the current user's group ids, and it
+# discards assignments to it without a word. The loop then read root's single
+# group and asked for a variant called "0".
+RUN_GROUPS=(
     "nano:600 small:480 medium:360"
     "small:600 medium:480 nano:360"
     "medium:600 nano:480 small:360"
@@ -50,7 +53,7 @@ start_mps() {
 start_mps || exit 1
 mkdir -p logs
 
-for group in "${GROUPS[@]}"; do
+for group in "${RUN_GROUPS[@]}"; do
     pids=()
     names=()
     for cell in $group; do
