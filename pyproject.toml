@@ -16,7 +16,7 @@ dependencies = [
     "pillow>=12.3.0",
     "pyarrow>=25.0.1",
     "python-dotenv>=1.2.3",
-    "rfdetr[onnx,train]==1.9.4",
+    "rfdetr[augment,onnx,train]==1.9.4",
     "torch==2.11.0+cu130",
     "torchvision==0.26.0+cu130",
     "tqdm>=4.70.0",
