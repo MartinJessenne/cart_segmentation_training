@@ -73,17 +73,18 @@ WAREHOUSE_AUG = {
 }
 
 # What deserves to outlive the machine: the retained weights, the exported
-# graph, the summaries and the logs. Per-epoch checkpoints are deliberately
-# excluded; they are heavy and carry no conclusion.
-PUBLISHED_PATTERNS = ["*.json", "*.txt", "*.csv", "*.onnx",
-                      "*best*.ckpt", "*best*.pth"]
+# graph, the summaries and the logs. last.ckpt is deliberately absent -- at
+# 534 MB against 133 for the stripped weights, it carries optimizer and
+# scheduler state that matters only to a resume on this machine.
+PUBLISHED_PATTERNS = ["*.json", "*.txt", "*.csv", "*.onnx", "*best*.pth"]
 
-# Ordered by preference: "last" is written every epoch and is the cheapest
-# resume point; the best-metric file is a fallback costing the epochs since it
-# was cut. Lightning writes .ckpt, older RF-DETR paths write .pth, so both are
-# matched rather than assumed.
-RESUME_PATTERNS = ["last.ckpt", "last.pth", "checkpoint.pth",
-                   "*best*.ckpt", "*best*.pth"]
+# Ordered by preference. last.ckpt is Lightning's own checkpoint, rewritten
+# every epoch with optimizer and scheduler state, so resuming from it continues
+# the run exactly. The best-metric files are stripped to {model, args, epoch}:
+# resuming from one restarts the optimizer, losing the momentum and the
+# schedule position, so they are a fallback for when last.ckpt is missing.
+RESUME_PATTERNS = ["last.ckpt", "checkpoint_best_total.pth",
+                   "checkpoint_best_ema.pth"]
 
 
 def class_names_from_dataset(dataset_dir):
