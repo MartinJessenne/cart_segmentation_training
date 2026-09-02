@@ -16,9 +16,12 @@ squashed square crops while deploying on 16:10 frames would compress the
 horizontal axis 1.6x more than the vertical, and the horizontal axis is the one
 carrying bearing, which is the dominant error term measured on the robot.
 
-Multi-scale is off by default. Its scale range spans +/-5 window steps around
-the nominal resolution, which is wide enough that neighbouring resolution tiers
-would overlap heavily and the comparison would stop measuring resolution.
+Multi-scale is off, and turning it on is now a mistake rather than a choice.
+Its scales run from -3 to +4 window steps around the nominal resolution, so they
+reach above it; the dataset is stored at 960x600, the largest size the resize
+pipeline ever requests without it, and anything above that would be upsampled
+from storage. It also spans a range wide enough that neighbouring resolution
+tiers would overlap and the comparison would stop measuring resolution.
 
 The script runs through to ONNX and to the Hub in one process. The training
 machine has no persistent storage, so a checkpoint that has not left it does
@@ -126,7 +129,11 @@ def publish(output_dir, repo, run_name):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("variant", choices=sorted(VARIANTS))
-    ap.add_argument("--dataset-dir", default="_rfdetr_dataset")
+    # 960x600 JPEG, produced by reencode_dataset.py. That is the largest input
+    # any tier requests, so nothing upsamples, and it decodes 6.5x faster than
+    # the 1280x800 PNG source -- which is what the two dataloader workers were
+    # spending the whole run on.
+    ap.add_argument("--dataset-dir", default="_rfdetr_dataset_960")
     # Short side of the 16:10 input. The long side follows at 1.6x. Both must be
     # divisible by patch_size * num_windows (24 for small and medium), which
     # 360, 480 and 600 satisfy, giving 360x576, 480x768 and 600x960.
@@ -145,19 +152,37 @@ def main():
     # Off by default: the multi-scale range is wide enough that adjacent
     # resolution tiers would overlap and the comparison would lose its meaning.
     ap.add_argument("--multi-scale", action="store_true")
-    # The jitter branch crops to a square (scale, scale) even when the resize
-    # preserves aspect, so a batch mixes 360x360 and 360x576 samples. Batching
-    # mixed sizes is normal and the collator pads to the batch maximum, but the
-    # Kornia path pads the images and not the masks, and mask collation raises.
-    # Kept as a switch so the CPU backend, which collates masks elsewhere, can
-    # be tried against it.
-    ap.add_argument("--scale-jitter", action="store_true")
+    # Option B of the resize pipeline: resize the short side to 400/500/600,
+    # take a square RandomSizedCrop, and resize that crop to the target. Square
+    # in, square out, so it zooms without distorting aspect. It is the recipe's
+    # only scale augmentation, and the deployed camera meets carts from 0.3 m to
+    # several metres, so it stays on -- as it is in RF-DETR itself.
+    #
+    # It makes a batch mix 360x360 and 360x576 samples. The collator pads the
+    # images to the batch maximum and leaves the masks alone; patch_rfdetr.py
+    # supplies the missing mask padding and must be applied before training.
+    ap.add_argument("--no-scale-jitter", dest="scale_jitter",
+                    action="store_false",
+                    help="disable the resize-crop-resize branch")
     ap.add_argument("--aug-backend", default="kornia", choices=("kornia", "cpu"))
     # 100 epochs is a ceiling, not a fixed duration: early stopping hands back
     # control once validation stops improving. The patience and delta below are
     # RF-DETR's own defaults; only the switch is off by default.
-    ap.add_argument("--patience", type=int, default=10)
+    # Given in epochs, converted to validation events below. RFDETREarlyStopping
+    # only ever runs on eval epochs, so its own counter is in validations: left
+    # at 10 alongside --eval-interval 5 it would tolerate 50 stagnant epochs and
+    # no run would stop early at all.
+    ap.add_argument("--patience", type=int, default=25,
+                    help="epochs without improvement before stopping")
     ap.add_argument("--min-delta", type=float, default=0.001)
+    # Validation costs more than training here. The mAP metric RLE-encodes every
+    # predicted mask on a single CPU core -- num_select is 100, over 2470 images
+    # -- and measured at 360x576 that ran about 25 minutes against 8 for the
+    # training epoch. Validating every fifth epoch amortises it; Lightning skips
+    # the loop entirely on the others, and RF-DETR forces one on the final epoch
+    # so a run always ends on a measured checkpoint.
+    ap.add_argument("--eval-interval", type=int, default=5,
+                    help="epochs between validations")
     # Comparing variants only means something if everything else is held fixed.
     # The seed is part of that, and RF-DETR leaves it unset on its own.
     ap.add_argument("--seed", type=int, default=42)
@@ -195,6 +220,7 @@ def main():
     resolution = args.resolution or nominal
     lr_drop = args.lr_drop or max(1, round(args.epochs * 0.75))
     checkpoint_interval = args.checkpoint_interval or (args.epochs + 1)
+    patience_evals = max(1, round(args.patience / args.eval_interval))
     long_side = round(resolution * 1.6)
     run_name = f"seg_{args.variant}_{resolution}"
     output_dir = args.output_dir or os.path.join("output", run_name)
@@ -213,6 +239,8 @@ def main():
     print(f"classes    : {classes}")
     print(f"schedule   : {args.epochs} epochs, warmup {args.warmup_epochs}, "
           f"lr_drop {lr_drop}, archive every {checkpoint_interval}")
+    print(f"validation : every {args.eval_interval} epochs, EMA only, "
+          f"patience {args.patience} epochs ({patience_evals} evals)")
     print(f"resume     : {resume_from or 'fresh run'}")
     print(f"output     : {output_dir}\n")
 
@@ -233,9 +261,19 @@ def main():
         checkpoint_interval=checkpoint_interval,
         warmup_epochs=args.warmup_epochs,
         lr_drop=lr_drop,
+        eval_interval=args.eval_interval,
+        # Validation forwards through the EMA weights only. Left False, RF-DETR
+        # runs a second independent forward pass and a second full round of RLE
+        # mask encoding for the base model, exactly doubling the phase that
+        # already dominates the run. The EMA weights are the ones exported, so
+        # the base model's metrics answer no question being asked here.
+        eval_ema_only=True,
         early_stopping=True,
-        early_stopping_patience=args.patience,
+        early_stopping_patience=patience_evals,
         early_stopping_min_delta=args.min_delta,
+        # eval_ema_only never logs the base metric, so the default
+        # max(regular, ema) comparison would read a key that is not there.
+        early_stopping_use_ema=True,
         seed=args.seed,
         class_names=classes,
         resume=resume_from,
@@ -256,7 +294,10 @@ def main():
         "warmup_epochs": args.warmup_epochs,
         "lr_drop": lr_drop,
         "checkpoint_interval": checkpoint_interval,
-        "patience": args.patience,
+        "eval_interval": args.eval_interval,
+        "eval_ema_only": True,
+        "patience_epochs": args.patience,
+        "patience_evals": patience_evals,
         "min_delta": args.min_delta,
         "seed": args.seed,
         "resumed_from": resume_from,
