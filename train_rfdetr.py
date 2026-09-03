@@ -222,6 +222,12 @@ def main():
     ap.add_argument("--no-resume", action="store_true")
     ap.add_argument("--output-dir", default=None)
     ap.add_argument("--hf-repo", default="UItraviolet/cart_segmentation_rfdetr")
+    ap.add_argument("--wandb", action="store_true", default=False,
+                    help="Enable Weights & Biases cloud telemetry")
+    ap.add_argument("--project", default="cart_segmentation",
+                    help="WandB project name")
+    ap.add_argument("--run-name", default=None,
+                    help="WandB run name")
     args = ap.parse_args()
 
     cls, nominal = VARIANTS[args.variant]
@@ -235,7 +241,7 @@ def main():
                  "different batch from the one asked for")
     grad_accum_steps = args.effective_batch // args.batch_size
     long_side = round(resolution * 1.6)
-    run_name = f"seg_{args.variant}_{resolution}"
+    run_name = args.run_name or f"seg_{args.variant}_{resolution}"
     output_dir = args.output_dir or os.path.join("output", run_name)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -300,6 +306,9 @@ def main():
         seed=args.seed,
         class_names=classes,
         resume=resume_from,
+        wandb=args.wandb,
+        project=args.project,
+        run=run_name,
     )
     duration = time.time() - start
 

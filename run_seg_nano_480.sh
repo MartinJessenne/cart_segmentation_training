@@ -44,6 +44,12 @@ fi
 
 # 3. Launch Training Loop
 echo "$(date +'%Y-%m-%d %H:%M:%S') [4/5] Starting RF-DETR Nano 480 training loop..."
+WANDB_FLAG=""
+if [ -n "$WANDB_API_KEY" ] || [ -f "$HOME/.netrc" ]; then
+    echo "$(date +'%Y-%m-%d %H:%M:%S') WandB key detected; enabling cloud telemetry (--wandb)."
+    WANDB_FLAG="--wandb"
+fi
+
 python3 train_rfdetr.py nano \
     --resolution 480 \
     --batch-size 32 \
@@ -51,7 +57,8 @@ python3 train_rfdetr.py nano \
     --dataset-dir _rfdetr_dataset_960 \
     --eval-interval 5 \
     --patience 25 \
-    --epochs 100
+    --epochs 100 \
+    $WANDB_FLAG
 
 echo "$(date +'%Y-%m-%d %H:%M:%S') [5/5] Training finished. Running one final sync pass..."
 python3 sync_hf.py --watch-dir output/seg_nano_480 --once
