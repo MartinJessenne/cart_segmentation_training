@@ -24,6 +24,7 @@ import os
 import sys
 
 import duckdb
+import time
 from huggingface_hub import HfApi
 
 REPO = "UItraviolet/industrial_cart"
@@ -67,8 +68,13 @@ def main():
     if args.limit_shards:
         shards = shards[:args.limit_shards]
 
-    con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
+    def make_connection():
+        c = duckdb.connect()
+        c.execute("INSTALL httpfs; LOAD httpfs;")
+        c.execute("SET http_timeout=30; SET http_retries=3; SET http_keep_alive=false;")
+        return c
+
+    con = make_connection()
 
     done_dir = os.path.join(args.out, "_done")
     os.makedirs(done_dir, exist_ok=True)
@@ -89,30 +95,46 @@ def main():
         img_dir = os.path.join(args.out, split_dir)
         msk_dir = os.path.join(args.out, "_masks", split_dir)
 
-        reader = con.execute(QUERY.format(repo=REPO, path=path)).to_arrow_reader(64)
-        rows = 0
-        written = 0
-        for batch in reader:
-            cols = batch.to_pydict()
-            for rgb, sem, labels in zip(cols["rgb_bytes"], cols["sem_bytes"],
-                                        cols["labels"]):
-                if rgb is None or sem is None:
-                    sys.exit(f"ABORT: missing bytes in {stem}, row {rows}")
-                name = f"{stem}_{rows:03d}"
-                for blob, target in ((rgb, os.path.join(img_dir, name + ".png")),
-                                     (sem, os.path.join(msk_dir, name + ".png"))):
-                    with open(target, "wb") as fh:
-                        fh.write(blob)
-                    written += len(blob)
-                with open(os.path.join(msk_dir, name + ".json"), "w") as fh:
-                    fh.write(labels if isinstance(labels, str) else json.dumps(labels))
-                rows += 1
+        shard_done = False
+        for attempt in range(1, 4):
+            try:
+                reader = con.execute(QUERY.format(repo=REPO, path=path)).to_arrow_reader(64)
+                rows = 0
+                written = 0
+                for batch in reader:
+                    cols = batch.to_pydict()
+                    for rgb, sem, labels in zip(cols["rgb_bytes"], cols["sem_bytes"],
+                                                cols["labels"]):
+                        if rgb is None or sem is None:
+                            sys.exit(f"ABORT: missing bytes in {stem}, row {rows}")
+                        name = f"{stem}_{rows:03d}"
+                        for blob, target in ((rgb, os.path.join(img_dir, name + ".png")),
+                                             (sem, os.path.join(msk_dir, name + ".png"))):
+                            with open(target, "wb") as fh:
+                                fh.write(blob)
+                            written += len(blob)
+                        with open(os.path.join(msk_dir, name + ".json"), "w") as fh:
+                            fh.write(labels if isinstance(labels, str) else json.dumps(labels))
+                        rows += 1
 
-        open(marker, "w").close()
-        total_rows += rows
-        total_bytes += written
-        print(f"[{n}/{len(shards)}] {stem} -> {split_dir}  {rows} frames  "
-              f"{written/1e6:.0f} MB  (running total {total_bytes/1e9:.2f} GB)")
+                open(marker, "w").close()
+                total_rows += rows
+                total_bytes += written
+                print(f"[{n}/{len(shards)}] {stem} -> {split_dir}  {rows} frames  "
+                      f"{written/1e6:.0f} MB  (running total {total_bytes/1e9:.2f} GB)")
+                shard_done = True
+                break
+            except Exception as e:
+                print(f"[{n}/{len(shards)}] {stem} error on attempt {attempt}/3: {e}, reconnecting...", flush=True)
+                time.sleep(3)
+                try:
+                    con.close()
+                except Exception:
+                    pass
+                con = make_connection()
+
+        if not shard_done:
+            sys.exit(f"ABORT: failed to fetch {stem} after 3 attempts")
 
     print(f"\n{total_rows} frames written, {total_bytes/1e9:.2f} GB on disk")
 
