@@ -5,7 +5,7 @@ set -euo pipefail
 REPO_DIR="/root/cart_segmentation_training"
 cd "$REPO_DIR"
 
-mkdir -p logs output
+mkdir -p logs output/seg_nano_480
 
 echo "$(date +'%Y-%m-%d %H:%M:%S') [1/5] Applying patch_rfdetr.py..."
 python3 patch_rfdetr.py
