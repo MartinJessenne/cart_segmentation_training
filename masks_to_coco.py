@@ -19,6 +19,7 @@ Produces <root>/<split>/_annotations.coco.json, the layout
 build_roboflow_from_coco expects.
 """
 import argparse
+import gc
 import json
 import os
 import sys
@@ -137,13 +138,15 @@ def build_split(root, split, workers):
           f"{empty} without annotation, {size_mb:.0f} MB")
     for cid, n in sorted(per_class.items()):
         print(f"    {CLASS_NAMES[cid]:9s} {n:6d}")
+    del images, annotations, coco
+    gc.collect()
     return per_class
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="_rfdetr_dataset")
-    ap.add_argument("--workers", type=int, default=os.cpu_count())
+    # Kept to 4 max: gVisor sentry cannot handle 20 concurrent Python image-decoding
+    # workers without thrashing IPC, VFS file descriptors, and triggering host eviction.
+    ap.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     args = ap.parse_args()
 
     print(f"{args.workers} processes\n")

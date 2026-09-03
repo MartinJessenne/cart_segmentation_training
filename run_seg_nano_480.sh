@@ -17,10 +17,10 @@ if [ ! -f "_rfdetr_dataset_960/train/_annotations.coco.json" ]; then
         echo "$(date +'%Y-%m-%d %H:%M:%S') [2a/5] Fetching RGB & masks (~31.2 GB)..."
         python3 fetch_rgb_masks.py --out _rfdetr_dataset
         echo "$(date +'%Y-%m-%d %H:%M:%S') [2b/5] Converting masks to COCO annotations..."
-        python3 masks_to_coco.py --root _rfdetr_dataset
+        python3 masks_to_coco.py --root _rfdetr_dataset --workers 4
     fi
     echo "$(date +'%Y-%m-%d %H:%M:%S') [2c/5] Re-encoding dataset to 960x600 JPEG q95..."
-    python3 reencode_dataset.py --src _rfdetr_dataset --dst _rfdetr_dataset_960
+    python3 reencode_dataset.py --src _rfdetr_dataset --dst _rfdetr_dataset_960 --workers 4
 else
     echo "$(date +'%Y-%m-%d %H:%M:%S') [2/5] _rfdetr_dataset_960 already present."
 fi
