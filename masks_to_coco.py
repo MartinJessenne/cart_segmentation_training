@@ -144,6 +144,8 @@ def build_split(root, split, workers):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default="_rfdetr_dataset")
     # Kept to 4 max: gVisor sentry cannot handle 20 concurrent Python image-decoding
     # workers without thrashing IPC, VFS file descriptors, and triggering host eviction.
     ap.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
