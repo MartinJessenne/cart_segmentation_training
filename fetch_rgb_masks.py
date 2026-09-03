@@ -24,6 +24,7 @@ import os
 import sys
 
 import duckdb
+import gc
 import time
 from huggingface_hub import HfApi
 
@@ -72,9 +73,9 @@ def main():
         c = duckdb.connect()
         c.execute("INSTALL httpfs; LOAD httpfs;")
         c.execute("SET http_timeout=30; SET http_retries=3; SET http_keep_alive=false;")
+        c.execute("SET max_memory='2GB';")
+        c.execute("SET preserve_insertion_order=false;")
         return c
-
-    con = make_connection()
 
     done_dir = os.path.join(args.out, "_done")
     os.makedirs(done_dir, exist_ok=True)
@@ -97,6 +98,7 @@ def main():
 
         shard_done = False
         for attempt in range(1, 4):
+            con = make_connection()
             try:
                 reader = con.execute(QUERY.format(repo=REPO, path=path)).to_arrow_reader(64)
                 rows = 0
@@ -125,13 +127,15 @@ def main():
                 shard_done = True
                 break
             except Exception as e:
-                print(f"[{n}/{len(shards)}] {stem} error on attempt {attempt}/3: {e}, reconnecting...", flush=True)
+                print(f"[{n}/{len(shards)}] {stem} error on attempt {attempt}/3: {e}, retrying...", flush=True)
                 time.sleep(3)
+            finally:
                 try:
                     con.close()
                 except Exception:
                     pass
-                con = make_connection()
+                del con
+                gc.collect()
 
         if not shard_done:
             sys.exit(f"ABORT: failed to fetch {stem} after 3 attempts")
