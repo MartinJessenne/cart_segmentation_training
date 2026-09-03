@@ -83,8 +83,13 @@ def main():
                     mtime = stat.st_mtime
                     size = stat.st_size
 
-                    # Ignore empty files or files modified in the last 2 seconds (might be currently writing)
-                    if size == 0 or (time.time() - mtime < 2):
+                    # Ignore empty files or files modified in the last 5 seconds (prevent uploading during active write)
+                    if size == 0 or (time.time() - mtime < 5):
+                        continue
+
+                    # Verify file size stability (ensure process finished writing before upload starts)
+                    time.sleep(1)
+                    if entry.stat().st_size != size:
                         continue
 
                     prev_state = uploaded_state.get(entry)
@@ -94,7 +99,7 @@ def main():
                     rel_path = entry.relative_to(watch_path)
                     path_in_repo = f"{run_name}/{rel_path.as_posix()}"
 
-                    print(f"[sync_hf] Uploading {entry.name} ({size / (1024*1024):.1f} MB) -> {path_in_repo}...")
+                    print(f"[sync_hf] Uploading {entry.name} ({size / (1024*1024):.1f} MB) -> {path_in_repo}...", flush=True)
                     api.upload_file(
                         path_or_fileobj=str(entry),
                         path_in_repo=path_in_repo,
@@ -103,9 +108,9 @@ def main():
                         token=token,
                     )
                     uploaded_state[entry] = (mtime, size)
-                    print(f"[sync_hf] Successfully uploaded {entry.name}")
+                    print(f"[sync_hf] Successfully uploaded {entry.name}", flush=True)
                 except Exception as e:
-                    print(f"[sync_hf] Upload failed for {entry.name}: {e}", file=sys.stderr)
+                    print(f"[sync_hf] Upload failed for {entry.name}: {e}", file=sys.stderr, flush=True)
 
         if args.once or not running:
             break
