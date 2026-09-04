@@ -46,22 +46,37 @@ mkdir -p logs "output/$RUN_NAME"
 echo "[1/5] patching rfdetr"
 python3 patch_rfdetr.py
 
-# The FOV-matched dataset. Building it from the 16:10 archive costs one JPEG
-# generation and a few minutes; rebuilding from the raw 1280x800 PNG shards
-# gives one fewer resize and costs the 31 GB download. Either is correct -- the
-# crop geometry is identical, because cropping 800 -> 720 rows and cropping
-# 600 -> 540 rows remove the same fraction of the same field of view.
+# The FOV-matched dataset. Building it from the 16:10 archive costs one extra
+# JPEG generation; rebuilding from the raw shards gives one fewer resize and
+# costs a much larger download. Either is correct -- the crop geometry is
+# identical, because cropping 800 -> 720 rows and cropping 600 -> 540 rows
+# remove the same fraction of the same field of view.
 if [ ! -f "$DATASET/train/_annotations.coco.json" ]; then
     echo "[2/5] building $DATASET (16:9, FOV-matched to the D455)"
+    # Bootstrap order is by cost, not preference. The pre-packaged archive
+    # (UItraviolet/cart_segmentation_coco_960, cart_rfdetr_960.tar.gz) is
+    # 5.3 GB and unpacks straight to _rfdetr_dataset_960; the raw route pulls
+    # the rgb and mask columns of UItraviolet/industrial_cart, ~31 GB out of an
+    # 81.7 GB repo, and then re-encodes them. Same dataset either way.
     if [ -f "_rfdetr_dataset/train/_annotations.coco.json" ]; then
-        SRC=_rfdetr_dataset; TARGET_W=960
+        SRC=_rfdetr_dataset
     elif [ -f "_rfdetr_dataset_960/train/_annotations.coco.json" ]; then
-        SRC=_rfdetr_dataset_960; TARGET_W=960
+        SRC=_rfdetr_dataset_960
     else
-        echo "!!! no source dataset. Fetch one first:"
-        echo "    python3 fetch_rgb_masks.py --out _rfdetr_dataset && python3 masks_to_coco.py --root _rfdetr_dataset"
+        echo "    no local dataset; pulling cart_rfdetr_960.tar.gz (5.3 GB)"
+        python3 -c "from huggingface_hub import hf_hub_download; \
+hf_hub_download(repo_id='UItraviolet/cart_segmentation_coco_960', \
+filename='cart_rfdetr_960.tar.gz', repo_type='dataset', local_dir='.')"
+        tar -xzf cart_rfdetr_960.tar.gz
+        SRC=_rfdetr_dataset_960
+    fi
+    if [ ! -f "$SRC/train/_annotations.coco.json" ]; then
+        echo "!!! $SRC has no annotations. Build from the raw shards instead:"
+        echo "    python3 fetch_rgb_masks.py --out _rfdetr_dataset"
+        echo "    python3 masks_to_coco.py --root _rfdetr_dataset --workers 4"
         exit 1
     fi
+    TARGET_W=960
     python3 reencode_dataset.py --src "$SRC" --dst "$DATASET" \
         --crop-aspect "$ASPECT" --target-w "$TARGET_W" --workers 4
 else
