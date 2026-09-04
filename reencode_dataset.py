@@ -47,7 +47,38 @@ from pycocotools import mask as mask_utils
 # The short side of the top resolution tier; see the module docstring for why
 # nothing ever asks for more.
 TARGET_H, TARGET_W = 600, 960
+
+# Vertical centre-crop applied to every source frame before the resize, as a
+# target aspect (width / height). None leaves the render untouched.
+#
+# Why cropping is the correct operation and not padding or stretching: the two
+# cameras already agree horizontally. The Isaac camera renders 1280x800 with a
+# 90.5 deg horizontal field of view (from its own camera_projection: HFOV =
+# 2*atan(1/P[0][0])), and the D455 colour stream publishes 1280x720 with
+# HFOV = 2*atan(width / 2*fx) = 2*atan(1280 / 2*631.5) = 90.8 deg. They differ
+# only vertically -- 64.5 deg rendered against 59.4 deg real -- because the
+# render is taller, not because it sees wider.
+#
+# Cropping rows therefore removes exactly the excess. Writing f_v for the
+# render's vertical focal length in pixels, f_v = (800/2) / tan(64.5/2) = 634 px,
+# the row count subtending the real camera's 59.4 deg is
+# 2 * 634 * tan(59.4/2) = 723. Cropping to 720 instead lands the field of view
+# at 59.2 deg -- 0.2 deg from the real camera, far inside the +/-3 cm docking
+# budget -- and buys an exact 16:9 frame, so the network input needs no stretch
+# at inference either.
+CROP_ASPECT = None
+
 SPLITS = ("train", "valid", "test")
+
+
+def crop_rows(src_h, src_w):
+    """Rows (top, height) kept by the centre-crop, or None when disabled."""
+    if CROP_ASPECT is None:
+        return None
+    keep_h = int(round(src_w / CROP_ASPECT))
+    if keep_h >= src_h:
+        return None
+    return (src_h - keep_h) // 2, keep_h
 
 
 def resize_rle(segmentation, out_h, out_w):
@@ -64,6 +95,13 @@ def resize_rle(segmentation, out_h, out_w):
     if isinstance(rle.get("counts"), str):
         rle = {"counts": rle["counts"].encode(), "size": rle["size"]}
     mask = mask_utils.decode(rle).astype(np.float32)
+    # The mask is cropped with the same rows as its image, so an instance that
+    # leaves the frame loses exactly the pixels its image lost and the bbox and
+    # area recomputed below stay consistent with what the network sees.
+    crop = crop_rows(mask.shape[0], mask.shape[1])
+    if crop is not None:
+        top, keep_h = crop
+        mask = mask[top:top + keep_h]
     resized = cv2.resize(mask, (out_w, out_h), interpolation=cv2.INTER_AREA)
     binary = np.asfortranarray((resized >= 0.5).astype(np.uint8))
     encoded = mask_utils.encode(binary)
@@ -79,6 +117,10 @@ def convert_image(job):
     src, dst = job
     with Image.open(src) as im:
         rgb = im.convert("RGB")
+        crop = crop_rows(rgb.height, rgb.width)
+        if crop is not None:
+            top, keep_h = crop
+            rgb = rgb.crop((0, top, rgb.width, top + keep_h))
         # Lanczos on the way down: the bars are the highest-frequency content in
         # the frame and bilinear would soften them before the model sees them.
         rgb = rgb.resize((TARGET_W, TARGET_H), Image.LANCZOS)
@@ -149,6 +191,8 @@ def convert_split(src_dir, dst_dir, workers):
 
 
 def main():
+    global TARGET_H, TARGET_W, CROP_ASPECT
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default="_rfdetr_dataset")
     ap.add_argument("--dst", default="_rfdetr_dataset_960")
@@ -157,7 +201,24 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--replace", action="store_true",
                     help="delete the source split once its copy is written")
+    # 1.7778 (16:9) matches the D455 colour stream; see CROP_ASPECT for the
+    # field-of-view arithmetic that makes cropping the right operation.
+    ap.add_argument("--crop-aspect", type=float, default=None,
+                    help="centre-crop each frame vertically to this width/height "
+                         "before resizing (1.7778 matches the real camera)")
+    ap.add_argument("--target-w", type=int, default=TARGET_W)
+    ap.add_argument("--target-h", type=int, default=None,
+                    help="defaults to --target-w / --crop-aspect when cropping")
     args = ap.parse_args()
+
+    CROP_ASPECT = args.crop_aspect
+    TARGET_W = args.target_w
+    if args.target_h is not None:
+        TARGET_H = args.target_h
+    elif CROP_ASPECT is not None:
+        TARGET_H = int(round(TARGET_W / CROP_ASPECT))
+    print(f"target {TARGET_W}x{TARGET_H}"
+          + (f", centre-cropped to aspect {CROP_ASPECT}" if CROP_ASPECT else ""))
 
     total_before = total_after = 0
     for split in SPLITS:

@@ -72,6 +72,51 @@ WAREHOUSE_AUG = {
     "GaussNoise": {"std_range": [0.01, 0.03], "p": 0.3},
 }
 
+# Sim-to-real augmentation: everything WAREHOUSE_AUG has, plus the geometric
+# transform it omits and wider photometric range.
+#
+# Affine is present here and absent above because the objection that removed it
+# does not apply to this detector. The network emits a MASK and a CLASS; metric
+# range is recovered downstream by back-projecting the masked depth through the
+# camera intrinsics (nxtbot_cart_pose core/estimator.cpp), never from where the
+# cart sits in the frame. So rotating or shearing the image cannot corrupt a
+# range cue, because no range cue is read from image position. What it does buy
+# is viewpoint diversity, which is the measured failure: the detector scores
+# 18/18 on held-out Isaac renders and 0/13 on real RealSense frames of a cart
+# it has to recognise, while a YOLO baseline trained on the same renders with
+# mosaic and random affine scores 10/13 on those same frames.
+#
+# VerticalFlip stays out on its own merits: the camera is rigidly mounted
+# looking forward, so a frame with the floor at the top is a view the robot
+# cannot produce, and spending capacity on it buys nothing.
+#
+# rotate is capped at 12 deg because the mount is rigid and the deck is flat --
+# the only real roll comes from suspension travel and floor slope, a few
+# degrees. The cap keeps the distribution near what the robot can actually see
+# while still breaking the pixel-exact vertical alignment every render shares.
+#
+# GaussNoise: Kornia cannot sample a per-image std and applies the UPPER bound
+# of std_range to every image it touches, so the upper bound is the noise level
+# actually delivered, and p is what fraction of images receive it. 0.04 sits
+# between the clean-render floor and the worst RealSense frames measured on the
+# bags; raising the bound further would apply the worst case universally.
+SIM2REAL_AUG = {
+    "HorizontalFlip": {"p": 0.5},
+    "Affine": {
+        "scale": (0.7, 1.4),
+        "translate_percent": (-0.12, 0.12),
+        "rotate": (-12, 12),
+        "shear": (-6, 6),
+        "p": 0.7,
+    },
+    "ColorJitter": {"brightness": 0.4, "contrast": 0.4,
+                    "saturation": 0.4, "hue": 0.15, "p": 0.8},
+    "GaussianBlur": {"blur_limit": 7, "p": 0.4},
+    "GaussNoise": {"std_range": [0.01, 0.04], "p": 0.5},
+}
+
+AUG_PRESETS = {"warehouse": WAREHOUSE_AUG, "sim2real": SIM2REAL_AUG}
+
 # What deserves to outlive the machine: the retained weights, the exported
 # graph, the summaries and the logs. last.ckpt is deliberately absent -- at
 # 534 MB against 133 for the stripped weights, it carries optimizer and
@@ -173,6 +218,23 @@ def main():
                     action="store_false",
                     help="disable the resize-crop-resize branch")
     ap.add_argument("--aug-backend", default="kornia", choices=("kornia", "cpu"))
+    # Only the kornia backend's supported set is usable here (HorizontalFlip,
+    # VerticalFlip, Rotate, Affine, ColorJitter, RandomBrightnessContrast,
+    # GaussianBlur, GaussNoise); anything else is silently not applied. Adding
+    # grayscale, motion blur or JPEG artefacts means --aug-backend cpu, which
+    # moves augmentation off the GPU and onto the two dataloader workers.
+    ap.add_argument("--aug-preset", default="warehouse", choices=sorted(AUG_PRESETS),
+                    help="warehouse = photometric only; sim2real = adds Affine "
+                         "and widens the photometric range")
+    # Long side as a multiple of the short side. 1.6 (16:10) matches the Isaac
+    # renders as they come out of the simulator; 1.7778 (16:9) matches the D455
+    # colour stream the robot actually publishes, and is the right choice
+    # whenever the dataset has been FOV-matched by reencode_dataset.py
+    # --crop-aspect. Both sides must stay divisible by 24 (patch_size x
+    # num_windows), which is checked below rather than left to fail inside the
+    # backbone: 432x768 and 480x768 both satisfy it.
+    ap.add_argument("--aspect", type=float, default=1.6,
+                    help="long side / short side; 1.6 = 16:10, 1.7778 = 16:9")
     # 100 epochs is a ceiling, not a fixed duration: early stopping hands back
     # control once validation stops improving. The patience and delta below are
     # RF-DETR's own defaults; only the switch is off by default.
@@ -240,8 +302,17 @@ def main():
                  f"--batch-size {args.batch_size}: the optimiser would see a "
                  "different batch from the one asked for")
     grad_accum_steps = args.effective_batch // args.batch_size
-    long_side = round(resolution * 1.6)
-    run_name = args.run_name or f"seg_{args.variant}_{resolution}"
+    long_side = round(resolution * args.aspect)
+    for name, side in (("short", resolution), ("long", long_side)):
+        if side % 24:
+            ap.error(f"{name} side {side} is not divisible by 24 "
+                     f"(patch_size x num_windows); 432x768 and 480x768 are valid")
+    aug_config = AUG_PRESETS[args.aug_preset]
+    # The preset and aspect are part of the identity: output_dir doubles as the
+    # resume source, so two runs that differ only in augmentation or aspect
+    # would otherwise share a directory and silently resume from each other.
+    run_name = args.run_name or (
+        f"seg_{args.variant}_{resolution}_{args.aug_preset}_{long_side}")
     output_dir = args.output_dir or os.path.join("output", run_name)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -251,7 +322,8 @@ def main():
         resume_from = find_resume_checkpoint(output_dir)
 
     print(f"variant    : {args.variant}  (nominal {nominal})")
-    print(f"input      : {resolution}x{long_side}  (16:10, short side {resolution})")
+    print(f"input      : {resolution}x{long_side}  (aspect {args.aspect:.4f})")
+    print(f"augment    : {args.aug_preset} on {args.aug_backend}")
     print(f"gpu        : {torch.cuda.get_device_name(0)}")
     print(f"capability : {torch.cuda.get_device_capability()}")
     print(f"dataset    : {args.dataset_dir}")
@@ -277,7 +349,7 @@ def main():
         square_resize_div_64=False,
         multi_scale=args.multi_scale,
         scale_jitter=args.scale_jitter,
-        aug_config=WAREHOUSE_AUG,
+        aug_config=aug_config,
         augmentation_backend=args.aug_backend,
         checkpoint_interval=checkpoint_interval,
         warmup_epochs=args.warmup_epochs,
@@ -322,7 +394,9 @@ def main():
         "effective_batch": args.effective_batch,
         "multi_scale": args.multi_scale,
         "scale_jitter": args.scale_jitter,
-        "augmentation": WAREHOUSE_AUG,
+        "augmentation": aug_config,
+        "aug_preset": args.aug_preset,
+        "aspect": args.aspect,
         "augmentation_backend": args.aug_backend,
         "warmup_epochs": args.warmup_epochs,
         "lr_drop": lr_drop,
