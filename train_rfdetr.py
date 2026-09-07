@@ -115,7 +115,12 @@ SIM2REAL_AUG = {
     "GaussNoise": {"std_range": [0.01, 0.04], "p": 0.5},
 }
 
-AUG_PRESETS = {"warehouse": WAREHOUSE_AUG, "sim2real": SIM2REAL_AUG}
+# "vanilla" is None rather than a dict, and that is the whole point: RF-DETR
+# reads None as "use my own AUG_CONFIG" and routes the pipeline through
+# torchvision instead of Albumentations. A dict here -- even one copied from
+# AUG_CONFIG -- takes the custom branch and is no longer the library default.
+AUG_PRESETS = {"warehouse": WAREHOUSE_AUG, "sim2real": SIM2REAL_AUG,
+               "vanilla": None}
 
 # What deserves to outlive the machine: the retained weights, the exported
 # graph, the summaries and the logs. last.ckpt is deliberately absent -- at
@@ -202,6 +207,48 @@ def main():
     # this and --batch-size, so lowering the micro-batch at a heavier tier
     # raises the accumulation and leaves the product untouched.
     ap.add_argument("--effective-batch", type=int, default=16)
+    # RF-DETR ships 2, which starves a fast GPU: the workers carry JPEG decode
+    # and the whole resize pipeline, and two of them saturate long before the
+    # accelerator does. Measured here at 336 square, batch 32: two workers pinned
+    # at 100% CPU each with the GPU at 69% and 202 W, ~6 min/epoch over 617 steps.
+    # The ceiling is the box, not the model -- raise it only as far as the host
+    # tolerates, and re-check GPU utilisation after changing it.
+    ap.add_argument("--num-workers", type=int, default=2,
+                    help="dataloader workers; 2 (RF-DETR's default) starves a fast GPU")
+    # ModelEma.update applies a FIXED decay and update_interval_steps only skips
+    # calls, so the two are coupled: at interval k the average still spans
+    # 1/(1-decay) updates, but those now cover k times as many steps. Holding the
+    # horizon in steps fixed requires decay' = 1 - k(1 - decay); at k=4 and
+    # RF-DETR's 0.993 that is 0.972. Passing one without the other silently
+    # changes how much of training the exported weights average over.
+    # RF-DETR compiles with dynamic=True, suppress_errors=True and
+    # capture_scalar_outputs=True (training/module_model.py). The profile this
+    # targets is flat -- hundreds of small ops, no hotspot -- which is what
+    # fusing away Python dispatch addresses.
+    #
+    # It is silently ignored unless CUDA is present and multi_scale is off, and
+    # it costs a few minutes of warmup on the first steps.
+    #
+    # CUDA graphs (mode="reduce-overhead") are NOT reachable from here: they
+    # need static shapes, but the deformable-attention path calls Tensor.item()
+    # for slice indices, which requires capture_scalar_outputs, and that is only
+    # safe with dynamic=True -- without it the symbols are unbacked and dynamo
+    # raises PendingUnbackedSymbolNotFound. Getting graphs would mean removing
+    # those .item() calls upstream.
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the model (CUDA only, no multi_scale)")
+    ap.add_argument("--ema-update-interval", type=int, default=1,
+                    help="steps between EMA updates; copies 33.6M params each time")
+    ap.add_argument("--ema-decay", type=float, default=0.993,
+                    help="EMA decay; window is 1/(1-decay) updates")
+    # Adam normalises by the gradient's second moment, so the linear scaling rule
+    # (derived for SGD) over-corrects. Square-root scaling is the usual choice:
+    # 4x the batch, 2x the rate. DETR heads are fragile early, which is what the
+    # warmup is for.
+    ap.add_argument("--lr", type=float, default=None,
+                    help="base LR; RF-DETR default 1e-4 at effective batch 16")
+    ap.add_argument("--lr-encoder", type=float, default=None,
+                    help="backbone LR; RF-DETR default 1.5e-4")
     # Off by default: the multi-scale range is wide enough that adjacent
     # resolution tiers would overlap and the comparison would lose its meaning.
     ap.add_argument("--multi-scale", action="store_true")
@@ -235,6 +282,20 @@ def main():
     # backbone: 432x768 and 480x768 both satisfy it.
     ap.add_argument("--aspect", type=float, default=1.6,
                     help="long side / short side; 1.6 = 16:10, 1.7778 = 16:9")
+    # RF-DETR's own geometry: A.Resize(s, s), a straight stretch to a square with
+    # no padding and no crop. Aspect is distorted identically at train and at
+    # inference, so the network is consistent with itself; --aspect is then
+    # meaningless and is ignored.
+    #
+    # Square is also what keeps every sample in a batch the same size, which is
+    # what makes patch_rfdetr.py unnecessary: that patch exists only to pad masks
+    # when the aspect-preserving branches emit differing sizes within one batch.
+    #
+    # The token count follows from the square side: at patch_size 12 a 336 square
+    # is 28x28 = 784 tokens against 36x64 = 2304 for 432x768, and an object keeps
+    # its fraction of the frame, so it spans proportionally fewer tokens.
+    ap.add_argument("--square", action="store_true",
+                    help="use RF-DETR's square resize (square_resize_div_64=True)")
     # 100 epochs is a ceiling, not a fixed duration: early stopping hands back
     # control once validation stops improving. The patience and delta below are
     # RF-DETR's own defaults; only the switch is off by default.
@@ -302,17 +363,23 @@ def main():
                  f"--batch-size {args.batch_size}: the optimiser would see a "
                  "different batch from the one asked for")
     grad_accum_steps = args.effective_batch // args.batch_size
-    long_side = round(resolution * args.aspect)
+    long_side = resolution if args.square else round(resolution * args.aspect)
     for name, side in (("short", resolution), ("long", long_side)):
         if side % 24:
             ap.error(f"{name} side {side} is not divisible by 24 "
                      f"(patch_size x num_windows); 432x768 and 480x768 are valid")
     aug_config = AUG_PRESETS[args.aug_preset]
+    # The kornia backend builds its pipeline from an explicit aug_config; asked
+    # for the library default it has nothing to build from. Sending the vanilla
+    # preset down the torchvision path is what "vanilla" means, so the backend
+    # follows the preset rather than being left to contradict it.
+    aug_backend = "cpu" if aug_config is None else args.aug_backend
     # The preset and aspect are part of the identity: output_dir doubles as the
     # resume source, so two runs that differ only in augmentation or aspect
     # would otherwise share a directory and silently resume from each other.
     run_name = args.run_name or (
-        f"seg_{args.variant}_{resolution}_{args.aug_preset}_{long_side}")
+        f"seg_{args.variant}_{resolution}_{args.aug_preset}_"
+        f"{'square' if args.square else long_side}")
     output_dir = args.output_dir or os.path.join("output", run_name)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -322,8 +389,12 @@ def main():
         resume_from = find_resume_checkpoint(output_dir)
 
     print(f"variant    : {args.variant}  (nominal {nominal})")
-    print(f"input      : {resolution}x{long_side}  (aspect {args.aspect:.4f})")
-    print(f"augment    : {args.aug_preset} on {args.aug_backend}")
+    tokens = (resolution // 12) * (long_side // 12)
+    print(f"input      : {resolution}x{long_side}  "
+          + (f"(square stretch, {tokens} tokens at patch 12)" if args.square
+             else f"(aspect {args.aspect:.4f}, {tokens} tokens at patch 12)"))
+    print(f"augment    : {args.aug_preset} on {aug_backend}"
+          + ("  [RF-DETR default AUG_CONFIG]" if aug_config is None else ""))
     print(f"gpu        : {torch.cuda.get_device_name(0)}")
     print(f"capability : {torch.cuda.get_device_capability()}")
     print(f"dataset    : {args.dataset_dir}")
@@ -331,14 +402,21 @@ def main():
     print(f"schedule   : {args.epochs} epochs, warmup {args.warmup_epochs}, "
           f"lr_drop {lr_drop}, archive every {checkpoint_interval}")
     print(f"batch      : {args.batch_size} micro x {grad_accum_steps} accum "
-          f"= {args.effective_batch} effective")
+          f"= {args.effective_batch} effective, {args.num_workers} workers")
+    print(f"ema        : decay {args.ema_decay} every {args.ema_update_interval} "
+          f"step(s) = {round(1 / (1 - args.ema_decay)) * args.ema_update_interval} "
+          f"steps of averaging")
+    print(f"compile    : {args.compile}")
+    print(f"lr         : {args.lr or 'default 1e-4'} / encoder "
+          f"{args.lr_encoder or 'default 1.5e-4'}")
     print(f"validation : every {args.eval_interval} epochs, EMA only, "
           f"patience {args.patience} epochs ({patience_evals} evals)")
     print(f"resume     : {resume_from or 'fresh run'}")
     print(f"output     : {output_dir}\n")
 
     start = time.time()
-    model = cls(resolution=resolution, num_classes=len(classes))
+    model = cls(resolution=resolution, num_classes=len(classes),
+                compile=args.compile)
     model.train(
         dataset_dir=args.dataset_dir,
         epochs=args.epochs,
@@ -346,11 +424,16 @@ def main():
         grad_accum_steps=grad_accum_steps,
         output_dir=output_dir,
         resolution=resolution,
-        square_resize_div_64=False,
+        num_workers=args.num_workers,
+        ema_decay=args.ema_decay,
+        ema_update_interval=args.ema_update_interval,
+        **({"lr": args.lr} if args.lr is not None else {}),
+        **({"lr_encoder": args.lr_encoder} if args.lr_encoder is not None else {}),
+        square_resize_div_64=args.square,
         multi_scale=args.multi_scale,
         scale_jitter=args.scale_jitter,
         aug_config=aug_config,
-        augmentation_backend=args.aug_backend,
+        augmentation_backend=aug_backend,
         checkpoint_interval=checkpoint_interval,
         warmup_epochs=args.warmup_epochs,
         # The scheduler's own interface. The flat lr_drop= argument still works
@@ -397,7 +480,14 @@ def main():
         "augmentation": aug_config,
         "aug_preset": args.aug_preset,
         "aspect": args.aspect,
-        "augmentation_backend": args.aug_backend,
+        "augmentation_backend": aug_backend,
+        "square_resize_div_64": args.square,
+        "num_workers": args.num_workers,
+        "compile": args.compile,
+        "ema_decay": args.ema_decay,
+        "ema_update_interval": args.ema_update_interval,
+        "lr": args.lr,
+        "lr_encoder": args.lr_encoder,
         "warmup_epochs": args.warmup_epochs,
         "lr_drop": lr_drop,
         "checkpoint_interval": checkpoint_interval,
