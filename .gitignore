@@ -20,3 +20,7 @@ _bench/
 epoch_cost.json
 
 _rfdetr_dataset_960/
+logs/
+
+# Notes d'experimentation locales
+30.*.md
