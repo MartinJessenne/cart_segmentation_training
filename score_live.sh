@@ -36,15 +36,25 @@ print(rows[-1]['epoch'] if rows else '?')" 2>/dev/null)
           # on Isaac mAP, which only ever climbs, so it will overwrite a better
           # real-domain checkpoint as training continues.
           ACC=$(echo "$RES" | grep -oE "= +[0-9.]+%" | head -1 | tr -dc "0-9.")
+          CONF=$(echo "$RES" | grep -oE "mean score [0-9.]+" | head -1 | awk '{print $3}')
           BEST_FILE="$RUN/best_real_accuracy.txt"
-          BEST=$(cat "$BEST_FILE" 2>/dev/null || echo 0)
-          if python3 -c "import sys; sys.exit(0 if float('${ACC:-0}') > float('$BEST') else 1)"; then
+          BEST_CONF_FILE="$RUN/best_real_confidence.txt"
+          BEST_ACC=$(cat "$BEST_FILE" 2>/dev/null || echo 0)
+          BEST_CONF=$(cat "$BEST_CONF_FILE" 2>/dev/null || echo 0)
+          if python3 -c "
+import sys
+acc, best_acc = float('${ACC:-0}'), float('${BEST_ACC:-0}')
+conf, best_conf = float('${CONF:-0}'), float('${BEST_CONF:-0}')
+is_better = (acc > best_acc) or (abs(acc - best_acc) < 1e-4 and conf > best_conf)
+sys.exit(0 if is_better else 1)
+"; then
             echo "$ACC" > "$BEST_FILE"
+            echo "$CONF" > "$BEST_CONF_FILE"
             mkdir -p "$RUN/best_real"
             cp -f "$CKPT" "$RUN/best_real/checkpoint_best_real.pth"
             cp -f "$ONNX" "$RUN/best_real/rfdetr-seg-nano-best-real.onnx"
             echo "$EP" > "$RUN/best_real/epoch.txt"
-            echo "SCORE   ^ new best on real ($ACC%), archived epoch $EP"
+            echo "SCORE   ^ new best on real ($ACC%, conf ${CONF:-?}), archived epoch $EP"
           fi
         fi
       fi
