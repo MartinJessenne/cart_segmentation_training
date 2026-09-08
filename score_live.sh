@@ -7,9 +7,9 @@
 # it on real_probe, then waits for the file to change and does it again.
 set -uo pipefail
 cd /root/cart_segmentation_training
-RUN=output/seg_nano_336_vanilla_square_b32
+RUN="${1:-output/seg_nano_288_sensor_square_b32}"
+SIDE="${2:-288}"
 CKPT="$RUN/checkpoint_best_ema.pth"
-SIDE=336
 LAST=""
 
 while true; do

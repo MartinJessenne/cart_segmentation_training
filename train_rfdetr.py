@@ -115,12 +115,35 @@ SIM2REAL_AUG = {
     "GaussNoise": {"std_range": [0.01, 0.04], "p": 0.5},
 }
 
+# Sensor-domain augmentation: targeted non-geometric photometric and sensor
+# perturbations (Trial Log 30.22, Lever 1).
+#
+# Simulates RealSense optical softness, Bayer demosaicing artifacts, sensor
+# shot noise, and warehouse lighting variance WITHOUT geometric warping
+# (no Affine/Rotate/Shear), preserving spatial aspect ratio and metric range.
+SENSOR_AUG = {
+    "HorizontalFlip": {"p": 0.5},
+    "ColorJitter": {
+        "brightness": 0.3,
+        "contrast": 0.3,
+        "saturation": 0.2,
+        "hue": 0.1,
+        "p": 0.6,
+    },
+    "GaussianBlur": {"blur_limit": 5, "p": 0.4},
+    "GaussNoise": {"std_range": [0.01, 0.03], "p": 0.5},
+}
+
 # "vanilla" is None rather than a dict, and that is the whole point: RF-DETR
 # reads None as "use my own AUG_CONFIG" and routes the pipeline through
 # torchvision instead of Albumentations. A dict here -- even one copied from
 # AUG_CONFIG -- takes the custom branch and is no longer the library default.
-AUG_PRESETS = {"warehouse": WAREHOUSE_AUG, "sim2real": SIM2REAL_AUG,
-               "vanilla": None}
+AUG_PRESETS = {
+    "warehouse": WAREHOUSE_AUG,
+    "sim2real": SIM2REAL_AUG,
+    "sensor": SENSOR_AUG,
+    "vanilla": None,
+}
 
 # What deserves to outlive the machine: the retained weights, the exported
 # graph, the summaries and the logs. last.ckpt is deliberately absent -- at
@@ -247,8 +270,8 @@ def main():
     # warmup is for.
     ap.add_argument("--lr", type=float, default=None,
                     help="base LR; RF-DETR default 1e-4 at effective batch 16")
-    ap.add_argument("--lr-encoder", type=float, default=None,
-                    help="backbone LR; RF-DETR default 1.5e-4")
+    ap.add_argument("--lr-encoder", "--lr-backbone", dest="lr_encoder", type=float, default=None,
+                    help="backbone LR; RF-DETR default 1.5e-4 (Trial Log 30.22 recommends 1e-5)")
     # Off by default: the multi-scale range is wide enough that adjacent
     # resolution tiers would overlap and the comparison would lose its meaning.
     ap.add_argument("--multi-scale", action="store_true")
