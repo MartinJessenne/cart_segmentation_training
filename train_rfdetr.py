@@ -335,8 +335,12 @@ def main():
     # training epoch. Validating every fifth epoch amortises it; Lightning skips
     # the loop entirely on the others, and RF-DETR forces one on the final epoch
     # so a run always ends on a measured checkpoint.
-    ap.add_argument("--eval-interval", type=int, default=5,
+    ap.add_argument("--eval-interval", type=int, default=1,
                     help="epochs between validations")
+    ap.add_argument("--compute-val-loss", action=argparse.BooleanOptionalAction, default=True,
+                    help="compute and log validation loss (val/loss) to WandB")
+    ap.add_argument("--eval-ema-only", action=argparse.BooleanOptionalAction, default=False,
+                    help="evaluate EMA model only (set False to log base model metrics to WandB)")
     # Comparing variants only means something if everything else is held fixed.
     # The seed is part of that, and RF-DETR leaves it unset on its own.
     ap.add_argument("--seed", type=int, default=42)
@@ -464,22 +468,14 @@ def main():
         # refinement phase with it without failing.
         lr_scheduler_kwargs={"lr_drop": lr_drop},
         eval_interval=args.eval_interval,
-        # Validation forwards through the EMA weights only. Left False, RF-DETR
-        # runs a second independent forward pass and a second full round of RLE
-        # mask encoding for the base model, exactly doubling the phase that
-        # already dominates the run. The EMA weights are the ones exported, so
-        # the base model's metrics answer no question being asked here.
-        eval_ema_only=True,
-        # Nothing reads the validation loss: early stopping and best-checkpoint
-        # selection both follow the EMA mAP, and the "step" schedule ignores its
-        # monitor. Computing it runs the Hungarian matcher over every validation
-        # mask for a number that is only ever printed.
-        compute_val_loss=False,
+        # With patch_matcher.py active, validation Hungarian matching is fast (<1ms).
+        # eval_ema_only=False ensures both base and EMA metrics are logged to WandB.
+        eval_ema_only=args.eval_ema_only,
+        # compute_val_loss=True logs validation loss (val/loss, val/loss_ce, etc.) to WandB.
+        compute_val_loss=args.compute_val_loss,
         early_stopping=True,
         early_stopping_patience=patience_evals,
         early_stopping_min_delta=args.min_delta,
-        # eval_ema_only never logs the base metric, so the default
-        # max(regular, ema) comparison would read a key that is not there.
         early_stopping_use_ema=True,
         seed=args.seed,
         class_names=classes,
@@ -515,7 +511,8 @@ def main():
         "lr_drop": lr_drop,
         "checkpoint_interval": checkpoint_interval,
         "eval_interval": args.eval_interval,
-        "eval_ema_only": True,
+        "eval_ema_only": args.eval_ema_only,
+        "compute_val_loss": args.compute_val_loss,
         "patience_epochs": args.patience,
         "patience_evals": patience_evals,
         "min_delta": args.min_delta,

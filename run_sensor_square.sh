@@ -18,7 +18,7 @@ LR=${LR:-1e-4}
 LR_ENCODER=${LR_ENCODER:-1e-5}
 NUM_WORKERS=${NUM_WORKERS:-8}
 AUG_PRESET=${AUG_PRESET:-sensor}
-EVAL_INTERVAL=${EVAL_INTERVAL:-2}
+EVAL_INTERVAL=${EVAL_INTERVAL:-1}
 EMA_INTERVAL=${EMA_INTERVAL:-4}
 EMA_DECAY=${EMA_DECAY:-0.972}
 COMPILE=${COMPILE:-1}
@@ -67,10 +67,12 @@ uv run python train_rfdetr.py nano \
   $([ "$COMPILE" = "1" ] && echo "--compile") \
   --epochs "$EPOCHS" \
   --eval-interval "$EVAL_INTERVAL" \
+  --compute-val-loss \
+  --no-eval-ema-only \
   --run-name "$RUN_NAME" \
   --project "$PROJECT" \
   --no-resume \
-  ${WANDB_API_KEY:+--wandb}
+  --wandb
 
 # 5. Export checkpoints & score all on real probe
 echo "[5/5] Exporting ONNX graphs and scoring final checkpoints on real frames..."
