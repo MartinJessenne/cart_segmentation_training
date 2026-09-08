@@ -272,6 +272,8 @@ def main():
                     help="base LR; RF-DETR default 1e-4 at effective batch 16")
     ap.add_argument("--lr-encoder", "--lr-backbone", dest="lr_encoder", type=float, default=None,
                     help="backbone LR; RF-DETR default 1.5e-4 (Trial Log 30.22 recommends 1e-5)")
+    ap.add_argument("--freeze-backbone", action="store_true", default=False,
+                    help="freeze DINOv2 backbone weights so natural image features are preserved")
     # Off by default: the multi-scale range is wide enough that adjacent
     # resolution tiers would overlap and the comparison would lose its meaning.
     ap.add_argument("--multi-scale", action="store_true")
@@ -439,7 +441,19 @@ def main():
     print(f"validation : every {args.eval_interval} epochs, EMA only, "
           f"patience {args.patience} epochs ({patience_evals} evals)")
     print(f"resume     : {resume_from or 'fresh run'}")
-    print(f"output     : {output_dir}\n")
+    if args.freeze_backbone or args.lr_encoder == 0.0:
+        print("[freeze] Freezing DINOv2 backbone (Linear Probing / Head-Only tuning)")
+        from rfdetr.training.module_model import RFDETRModelModule
+        _orig_module_init = RFDETRModelModule.__init__
+
+        def _frozen_module_init(self, model_config, train_config):
+            _orig_module_init(self, model_config, train_config)
+            if hasattr(self.model, "backbone"):
+                for p in self.model.backbone.parameters():
+                    p.requires_grad = False
+                print("[freeze] Successfully set requires_grad=False on all backbone parameters")
+
+        RFDETRModelModule.__init__ = _frozen_module_init
 
     start = time.time()
     model = cls(resolution=resolution, num_classes=len(classes),
