@@ -8,6 +8,14 @@
 #
 # Reference: Trial Log 30.22 (2026-09-07) & Status Report (2026-09-03)
 set -euo pipefail
+
+# Source molab secrets if present (WANDB_API_KEY, HF_TOKEN)
+if [ -r "/marimo/storage/secret.sh" ]; then
+  set -a
+  . "/marimo/storage/secret.sh"
+  set +a
+fi
+
 cd /root/cart_segmentation_training
 
 RESOLUTION=${RESOLUTION:-288}
