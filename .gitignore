@@ -1,26 +1,46 @@
-# Python-generated files
+# Byte-compiled / optimized / C-extensions
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
+*.so
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
-# Environnements virtuels
-.venv
+# Environments & secrets
+.venv/
+env/
+venv/
 .env
+*.token
 
-# Sorties de la chaine : rapatriees ou reconstruites, jamais versionnees.
+# Datasets and intermediate representations (fetched or generated)
+_dataset_raw/
+_dataset_960/
 _rfdetr_dataset/
+_rfdetr_dataset_960/
 _preview/
-output/
 cart_dataset/
 dataset/
+*.tar.gz
+
+# Training runs, outputs and logs
+output/
+runs/
+logs/
 _bench/
 epoch_cost.json
 
-_rfdetr_dataset_960/
-logs/
+# Model weights & compiled engines
+*.pt
+*.pth
+*.onnx
+*.engine
 
-# Notes d'experimentation locales
+# Scratch & visualizations
+visualizations/
+contact_sheet.png
+
+# Local experiment notes
 30.*.md

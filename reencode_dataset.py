@@ -193,12 +193,13 @@ def convert_split(src_dir, dst_dir, workers):
 def main():
     global TARGET_H, TARGET_W, CROP_ASPECT
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--src", default="_rfdetr_dataset")
-    ap.add_argument("--dst", default="_rfdetr_dataset_960")
-    # Kept low on purpose: this machine is the one that must stay up, and the
-    # job is short enough that two processes finish it in about ten minutes.
-    ap.add_argument("--workers", type=int, default=4)
+    ap = argparse.ArgumentParser(description="Re-encode dataset to high-speed JPEG cache")
+    ap.add_argument("--src", default="_dataset_raw",
+                    help="Source dataset directory (default: _dataset_raw)")
+    ap.add_argument("--dst", default="_dataset_960",
+                    help="Destination cache directory (default: _dataset_960)")
+    ap.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1),
+                    help="Worker processes for parallel conversion (default: 4)")
     ap.add_argument("--replace", action="store_true",
                     help="delete the source split once its copy is written")
     # 1.7778 (16:9) matches the D455 colour stream; see CROP_ASPECT for the

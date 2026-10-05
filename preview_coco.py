@@ -25,8 +25,9 @@ OVERLAY = {"picanol": (60, 60, 230), "colruyt": (60, 210, 60),
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="_rfdetr_dataset")
+    ap = argparse.ArgumentParser(description="Render visual previews of COCO annotations")
+    ap.add_argument("--root", default="_dataset_raw",
+                    help="Dataset directory containing split folders (default: _dataset_raw)")
     ap.add_argument("--split", default="train")
     ap.add_argument("--per-class", type=int, default=4)
     ap.add_argument("--out", default="_preview")

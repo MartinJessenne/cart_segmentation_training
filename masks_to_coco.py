@@ -29,7 +29,7 @@ import numpy as np
 import pycocotools.mask as coco_mask
 from PIL import Image
 
-# Mask colour per internal id, as written by generate_dataset_6_0_1.py.
+# Mask RGB color mapping per class ID.
 SEMANTIC_COLORS = {
     0: (220, 50, 50),    # picanol
     1: (50, 200, 50),    # colruyt
@@ -144,10 +144,10 @@ def build_split(root, split, workers):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default="_rfdetr_dataset")
-    # Kept to 4 max: gVisor sentry cannot handle 20 concurrent Python image-decoding
-    # workers without thrashing IPC, VFS file descriptors, and triggering host eviction.
+    ap = argparse.ArgumentParser(description="Convert semantic masks to COCO RLE instance annotations")
+    ap.add_argument("--root", default="_dataset_raw",
+                    help="Root directory containing downloaded splits (default: _dataset_raw)")
+    # Default to a conservative worker count to prevent CPU/memory thrashing
     ap.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     args = ap.parse_args()
 
